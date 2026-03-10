@@ -1,23 +1,23 @@
 /*======================================================================================
- * snobol4c_module.c — CPython extension: SNOBOL4 pattern match engine
+ * snobol4c_module.c — CPython extension: SNOBOL4 pattern match engine (v2)
  *
  * Python builds the PATTERN tree.  C runs the match engine.  Python gets the result.
  *
+ * Memory: malloc/realloc throughout.  No arenas, no fixed limits.
+ *   - realloc(NULL, size) = malloc
+ *   - realloc(p, 0)       = free
+ *
  * Build:
  *   python3 setup.py build_ext --inplace
- *   — or —
- *   gcc -shared -fPIC -O2 -o snobol4c$(python3-config --extension-suffix) \
- *       snobol4c_module.c $(python3-config --includes --ldflags)
  *======================================================================================*/
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <string.h>
 #include <stdlib.h>
-#include <assert.h>
 #include <stdbool.h>
 
 /*======================================================================================
- * PATTERN types — same enum as SNOBOL4c.c
+ * PATTERN types
  *======================================================================================*/
 enum {
     T_ABORT   =  0,
@@ -40,7 +40,6 @@ enum {
     T_SPAN    = 17,
     T_SUCCEED = 18,
     T_TAB     = 19,
-    /* --- composites --- */
     T_PI      = 29,     /* Π  alternation  */
     T_SIGMA   = 30,     /* Σ  sequence     */
     T_RHO     = 39,     /* ρ  conjunction  */
@@ -51,60 +50,50 @@ enum {
     T_OMEGA   = 42,     /* ω  end of line  */
 };
 
-/* Actions */
 #define PROCEED 0
 #define SUCCESS 1
 #define FAILURE 2
 #define RECEDE  3
 
 /*======================================================================================
- * C PATTERN node — runtime-built from Python tree
+ * C PATTERN node — malloc'd from Python tree
  *======================================================================================*/
 #define MAX_CHILDREN 30
 
 typedef struct Pattern {
     int                 type;
-    int                 n;              /* child count (Σ,Π) or integer arg (POS,LEN) */
-    const char *        s;              /* string arg (σ) — borrowed from Python       */
-    Py_ssize_t          s_len;          /* length of s                                  */
-    const char *        chars;          /* char set (ANY,SPAN,BREAK,NOTANY) — borrowed  */
+    int                 n;
+    const char *        s;
+    Py_ssize_t          s_len;
+    const char *        chars;
     struct Pattern *    children[MAX_CHILDREN];
 } Pattern;
 
-/*======================================================================================
- * Arena — bump allocator, freed all at once after match
- *======================================================================================*/
+/*--- Pattern tracking: realloc'd list of all malloc'd nodes for cleanup ---*/
 typedef struct {
-    Pattern *   nodes;
+    Pattern **  list;
     int         count;
-    int         capacity;
-} Arena;
+} PatternList;
 
-static Pattern *arena_alloc(Arena *a) {
-    if (a->count >= a->capacity) {
-        a->capacity = a->capacity ? a->capacity * 2 : 64;
-        a->nodes = realloc(a->nodes, a->capacity * sizeof(Pattern));
-        if (!a->nodes) return NULL;
-    }
-    Pattern *p = &a->nodes[a->count++];
+static Pattern *pattern_alloc(PatternList *pl) {
+    pl->list = realloc(pl->list, (pl->count + 1) * sizeof(Pattern *));
+    Pattern *p = malloc(sizeof(Pattern));
     memset(p, 0, sizeof(Pattern));
+    pl->list[pl->count++] = p;
     return p;
 }
 
-static void arena_free(Arena *a) {
-    free(a->nodes);
-    a->nodes = NULL;
-    a->count = a->capacity = 0;
+static void pattern_free_all(PatternList *pl) {
+    for (int i = 0; i < pl->count; i++)
+        free(pl->list[i]);
+    free(pl->list);
+    pl->list  = NULL;
+    pl->count = 0;
 }
 
 /*======================================================================================
  * Python → C PATTERN tree converter
- *
- * We identify Python classes by their __name__.  This is simple and works for
- * the UTF-8 Greek letters (σ, Σ, Π, ε, etc.) that the Python classes use.
  *======================================================================================*/
-
-/* Helper: get class name as C string */
 static const char *py_class_name(PyObject *obj) {
     PyObject *tp = (PyObject *)Py_TYPE(obj);
     PyObject *name = PyObject_GetAttrString(tp, "__name__");
@@ -114,7 +103,6 @@ static const char *py_class_name(PyObject *obj) {
     return s;
 }
 
-/* Helper: get int attribute */
 static int py_get_int(PyObject *obj, const char *attr) {
     PyObject *val = PyObject_GetAttrString(obj, attr);
     if (!val) return 0;
@@ -123,36 +111,31 @@ static int py_get_int(PyObject *obj, const char *attr) {
     return n;
 }
 
-/* Helper: get string attribute, return borrowed pointer + length */
 static const char *py_get_str(PyObject *obj, const char *attr, Py_ssize_t *len) {
     PyObject *val = PyObject_GetAttrString(obj, attr);
     if (!val) return NULL;
     const char *s = PyUnicode_AsUTF8AndSize(val, len);
     Py_DECREF(val);
-    return s;      /* safe: the Python PATTERN object keeps the string alive */
+    return s;
 }
 
-/* Forward decl */
-static Pattern *convert(Arena *arena, PyObject *py_pat);
+static Pattern *convert(PatternList *pl, PyObject *py_pat);
 
-/* Convert children from a Python tuple (AP attribute) */
-static int convert_children(Arena *arena, Pattern *p, PyObject *py_pat) {
+static int convert_children(PatternList *pl, Pattern *p, PyObject *py_pat) {
     PyObject *AP = PyObject_GetAttrString(py_pat, "AP");
     if (!AP) return -1;
     Py_ssize_t n = PyTuple_Size(AP);
     if (n > MAX_CHILDREN) n = MAX_CHILDREN;
     p->n = (int)n;
     for (Py_ssize_t i = 0; i < n; i++) {
-        PyObject *child = PyTuple_GetItem(AP, i);  /* borrowed */
-        p->children[i] = convert(arena, child);
+        p->children[i] = convert(pl, PyTuple_GetItem(AP, i));
         if (!p->children[i]) { Py_DECREF(AP); return -1; }
     }
     Py_DECREF(AP);
     return 0;
 }
 
-/* Convert a single child from .P attribute */
-static int convert_single_child(Arena *arena, Pattern *p, PyObject *py_pat) {
+static int convert_single_child(PatternList *pl, Pattern *p, PyObject *py_pat) {
     PyObject *child = PyObject_GetAttrString(py_pat, "P");
     if (!child || child == Py_None) {
         Py_XDECREF(child);
@@ -160,238 +143,227 @@ static int convert_single_child(Arena *arena, Pattern *p, PyObject *py_pat) {
         return 0;
     }
     p->n = 1;
-    p->children[0] = convert(arena, child);
+    p->children[0] = convert(pl, child);
     Py_DECREF(child);
     return p->children[0] ? 0 : -1;
 }
 
-/*
- * The main converter.  Maps Python class name → C type enum + attributes.
- *
- * Supports (Phase 1+):
- *   σ, POS, RPOS, LEN, TAB, RTAB, REM,
- *   ANY, NOTANY, SPAN, BREAK,
- *   Σ, Π, ρ, π, ε, α, ω,
- *   ARB, ARBNO, BAL, FENCE,
- *   FAIL, ABORT, SUCCEED
- */
-static Pattern *convert(Arena *arena, PyObject *py_pat) {
-    Pattern *p = arena_alloc(arena);
+static Pattern *convert(PatternList *pl, PyObject *py_pat) {
+    Pattern *p = pattern_alloc(pl);
     if (!p) { PyErr_NoMemory(); return NULL; }
 
     const char *name = py_class_name(py_pat);
     if (!name) return NULL;
 
-    /* --- Literal σ --- */
-    if (strcmp(name, "\xcf\x83") == 0) {                 /* UTF-8 for σ */
+    if      (strcmp(name, "\xcf\x83") == 0) {               /* σ */
         p->type = T_LITERAL;
         p->s = py_get_str(py_pat, "s", &p->s_len);
     }
-    /* --- Position primitives with int .n --- */
-    else if (strcmp(name, "POS") == 0) {
-        p->type = T_POS;
-        p->n = py_get_int(py_pat, "n");
-    }
-    else if (strcmp(name, "RPOS") == 0) {
-        p->type = T_RPOS;
-        p->n = py_get_int(py_pat, "n");
-    }
-    else if (strcmp(name, "LEN") == 0) {
-        p->type = T_LEN;
-        p->n = py_get_int(py_pat, "n");
-    }
-    else if (strcmp(name, "TAB") == 0) {
-        p->type = T_TAB;
-        p->n = py_get_int(py_pat, "n");
-    }
-    else if (strcmp(name, "RTAB") == 0) {
-        p->type = T_RTAB;
-        p->n = py_get_int(py_pat, "n");
-    }
-    /* --- Character set primitives with .chars --- */
-    else if (strcmp(name, "ANY") == 0) {
-        p->type = T_ANY;
-        Py_ssize_t dummy;
-        p->chars = py_get_str(py_pat, "chars", &dummy);
-    }
-    else if (strcmp(name, "NOTANY") == 0) {
-        p->type = T_NOTANY;
-        Py_ssize_t dummy;
-        p->chars = py_get_str(py_pat, "chars", &dummy);
-    }
-    else if (strcmp(name, "SPAN") == 0) {
-        p->type = T_SPAN;
-        Py_ssize_t dummy;
-        p->chars = py_get_str(py_pat, "chars", &dummy);
-    }
-    else if (strcmp(name, "BREAK") == 0) {
-        p->type = T_BREAK;
-        Py_ssize_t dummy;
-        p->chars = py_get_str(py_pat, "chars", &dummy);
-    }
-    else if (strcmp(name, "BREAKX") == 0) {
-        p->type = T_BREAK;  /* same as BREAK for now */
-        Py_ssize_t dummy;
-        p->chars = py_get_str(py_pat, "chars", &dummy);
-    }
-    /* --- Composites with children tuple .AP --- */
-    else if (strcmp(name, "\xce\xa3") == 0) {            /* UTF-8 for Σ */
+    else if (strcmp(name, "POS") == 0)     { p->type = T_POS;    p->n = py_get_int(py_pat, "n"); }
+    else if (strcmp(name, "RPOS") == 0)    { p->type = T_RPOS;   p->n = py_get_int(py_pat, "n"); }
+    else if (strcmp(name, "LEN") == 0)     { p->type = T_LEN;    p->n = py_get_int(py_pat, "n"); }
+    else if (strcmp(name, "TAB") == 0)     { p->type = T_TAB;    p->n = py_get_int(py_pat, "n"); }
+    else if (strcmp(name, "RTAB") == 0)    { p->type = T_RTAB;   p->n = py_get_int(py_pat, "n"); }
+    else if (strcmp(name, "ANY") == 0)     { p->type = T_ANY;    Py_ssize_t d; p->chars = py_get_str(py_pat, "chars", &d); }
+    else if (strcmp(name, "NOTANY") == 0)  { p->type = T_NOTANY; Py_ssize_t d; p->chars = py_get_str(py_pat, "chars", &d); }
+    else if (strcmp(name, "SPAN") == 0)    { p->type = T_SPAN;   Py_ssize_t d; p->chars = py_get_str(py_pat, "chars", &d); }
+    else if (strcmp(name, "BREAK") == 0)   { p->type = T_BREAK;  Py_ssize_t d; p->chars = py_get_str(py_pat, "chars", &d); }
+    else if (strcmp(name, "BREAKX") == 0)  { p->type = T_BREAK;  Py_ssize_t d; p->chars = py_get_str(py_pat, "chars", &d); }
+    else if (strcmp(name, "\xce\xa3") == 0) {                   /* Σ */
         p->type = T_SIGMA;
-        if (convert_children(arena, p, py_pat) < 0) return NULL;
+        if (convert_children(pl, p, py_pat) < 0) return NULL;
     }
-    else if (strcmp(name, "\xce\xa0") == 0) {            /* UTF-8 for Π */
+    else if (strcmp(name, "\xce\xa0") == 0) {                   /* Π */
         p->type = T_PI;
-        if (convert_children(arena, p, py_pat) < 0) return NULL;
+        if (convert_children(pl, p, py_pat) < 0) return NULL;
     }
-    else if (strcmp(name, "\xcf\x81") == 0) {            /* UTF-8 for ρ */
+    else if (strcmp(name, "\xcf\x81") == 0) {                   /* ρ */
         p->type = T_RHO;
-        if (convert_children(arena, p, py_pat) < 0) return NULL;
+        if (convert_children(pl, p, py_pat) < 0) return NULL;
     }
-    /* --- Single-child composites with .P --- */
-    else if (strcmp(name, "\xcf\x80") == 0) {            /* UTF-8 for π */
+    else if (strcmp(name, "\xcf\x80") == 0) {                   /* π */
         p->type = T_pi;
-        if (convert_single_child(arena, p, py_pat) < 0) return NULL;
+        if (convert_single_child(pl, p, py_pat) < 0) return NULL;
     }
     else if (strcmp(name, "ARBNO") == 0) {
         p->type = T_ARBNO;
-        if (convert_single_child(arena, p, py_pat) < 0) return NULL;
+        if (convert_single_child(pl, p, py_pat) < 0) return NULL;
     }
     else if (strcmp(name, "FENCE") == 0) {
         p->type = T_FENCE;
-        if (convert_single_child(arena, p, py_pat) < 0) return NULL;
+        if (convert_single_child(pl, p, py_pat) < 0) return NULL;
     }
-    /* --- No-argument primitives --- */
-    else if (strcmp(name, "\xce\xb5") == 0) {            /* UTF-8 for ε */
-        p->type = T_EPSILON;
-    }
-    else if (strcmp(name, "\xce\xb1") == 0) {            /* UTF-8 for α */
-        p->type = T_ALPHA;
-    }
-    else if (strcmp(name, "\xcf\x89") == 0) {            /* UTF-8 for ω */
-        p->type = T_OMEGA;
-    }
-    else if (strcmp(name, "ARB") == 0) {
-        p->type = T_ARB;
-    }
-    else if (strcmp(name, "BAL") == 0) {
-        p->type = T_BAL;
-    }
-    else if (strcmp(name, "REM") == 0) {
-        p->type = T_REM;
-    }
-    else if (strcmp(name, "FAIL") == 0) {
-        p->type = T_FAIL;
-    }
-    else if (strcmp(name, "ABORT") == 0) {
-        p->type = T_ABORT;
-    }
-    else if (strcmp(name, "SUCCEED") == 0) {
-        p->type = T_SUCCEED;
-    }
-    else if (strcmp(name, "MARB") == 0) {
-        p->type = T_MARB;
-    }
+    else if (strcmp(name, "\xce\xb5") == 0)  p->type = T_EPSILON;  /* ε */
+    else if (strcmp(name, "\xce\xb1") == 0)  p->type = T_ALPHA;    /* α */
+    else if (strcmp(name, "\xcf\x89") == 0)  p->type = T_OMEGA;    /* ω */
+    else if (strcmp(name, "ARB") == 0)       p->type = T_ARB;
+    else if (strcmp(name, "BAL") == 0)       p->type = T_BAL;
+    else if (strcmp(name, "REM") == 0)       p->type = T_REM;
+    else if (strcmp(name, "FAIL") == 0)      p->type = T_FAIL;
+    else if (strcmp(name, "ABORT") == 0)     p->type = T_ABORT;
+    else if (strcmp(name, "SUCCEED") == 0)   p->type = T_SUCCEED;
+    else if (strcmp(name, "MARB") == 0)      p->type = T_MARB;
     else {
-        PyErr_Format(PyExc_TypeError,
-            "snobol4c: unsupported pattern type '%s'", name);
+        PyErr_Format(PyExc_TypeError, "snobol4c: unsupported pattern type '%s'", name);
         return NULL;
     }
-
     return p;
 }
 
 /*======================================================================================
- * Match engine state
+ * Psi — realloc'd array.  Plain push/pop stack.  Deep-copied into omega snapshots.
  *======================================================================================*/
-
-/*--- Psi: linked-list parent stack for tree descent (like original SNOBOL4c.c)
- *    Each node is separately allocated so omega save/restore gets
- *    a persistent snapshot — old entries are never overwritten.         ---*/
-typedef struct PsiNode {
-    Pattern *           PI;
-    int                 ctx;
-    struct PsiNode *    next;
-} PsiNode;
-
-static inline PsiNode *psi_push(PsiNode *psi, Pattern *PI, int ctx) {
-    PsiNode *n = malloc(sizeof(PsiNode));
-    n->PI   = PI;
-    n->ctx  = ctx;
-    n->next = psi;
-    return n;
-}
+typedef struct {
+    Pattern *   PI;
+    int         ctx;
+} PsiEntry;
 
 typedef struct {
-    const char *    SIGMA;          /* scan-start pointer       */
-    int             DELTA;          /* scan-start position      */
-    int             OMEGA;          /* subject length           */
-    const char *    sigma;          /* current pointer          */
-    int             delta;          /* current position         */
-    Pattern *       PI;             /* current pattern node     */
-    int             fenced;
-    int             yielded;
-    int             ctx;            /* child index / counter    */
-    PsiNode *       psi;            /* parent stack (linked list) */
-} State;
+    PsiEntry *  entries;    /* realloc'd with doubling */
+    int         count;
+    int         capacity;
+} Psi;
 
-/*--- Omega (Ω) backtrack stack ---*/
-#define OMEGA_MAX 4096
+static inline void psi_push(Psi *psi, Pattern *PI, int ctx) {
+    if (psi->count >= psi->capacity) {
+        psi->capacity = psi->capacity ? psi->capacity * 2 : 8;
+        psi->entries = realloc(psi->entries, psi->capacity * sizeof(PsiEntry));
+    }
+    psi->entries[psi->count++] = (PsiEntry){PI, ctx};
+}
 
-static State    omega_stack[OMEGA_MAX];
-static int      omega_top = -1;
+static inline bool psi_pop(Psi *psi, Pattern **PI, int *ctx) {
+    if (psi->count > 0) {
+        *PI  = psi->entries[--psi->count].PI;
+        *ctx = psi->entries[  psi->count].ctx;
+        return true;
+    }
+    return false;
+}
 
-static inline void omega_init(void)                     { omega_top = -1; }
-static inline void omega_push(State *z)                 { assert(omega_top < OMEGA_MAX - 1); omega_stack[++omega_top] = *z; }
-static inline int  omega_empty(void)                    { return omega_top < 0; }
-static inline State *omega_tip(void)                    { return omega_top >= 0 ? &omega_stack[omega_top] : NULL; }
-static inline void omega_pop(State *z) {
-    if (omega_top >= 0) { *z = omega_stack[omega_top--]; }
-    else                { memset(z, 0, sizeof(State)); z->PI = NULL; }
+static inline Psi psi_snapshot(Psi *psi) {
+    Psi snap = {NULL, psi->count, psi->count};
+    if (psi->count > 0) {
+        snap.entries = malloc(psi->count * sizeof(PsiEntry));
+        memcpy(snap.entries, psi->entries, psi->count * sizeof(PsiEntry));
+    }
+    return snap;
+}
+
+static inline void psi_restore(Psi *psi, Psi *snap) {
+    if (snap->count > psi->capacity) {
+        psi->capacity = snap->count;
+        psi->entries = realloc(psi->entries, psi->capacity * sizeof(PsiEntry));
+    }
+    psi->count = snap->count;
+    if (snap->count > 0)
+        memcpy(psi->entries, snap->entries, snap->count * sizeof(PsiEntry));
 }
 
 /*======================================================================================
- * State navigation (ζ functions from SNOBOL4c.c, using linked-list psi)
+ * State — engine working state (psi is separate)
  *======================================================================================*/
-static inline void z_down(State *z) {
-    z->psi   = psi_push(z->psi, z->PI, z->ctx);
+typedef struct {
+    const char *    SIGMA;
+    int             DELTA;
+    int             OMEGA;
+    const char *    sigma;
+    int             delta;
+    Pattern *       PI;
+    int             fenced;
+    int             yielded;
+    int             ctx;
+} State;
+
+/*======================================================================================
+ * Omega — realloc'd backtrack stack.  Each entry owns a psi snapshot.
+ *======================================================================================*/
+typedef struct {
+    State   state;
+    Psi     psi_snap;   /* owned copy */
+} OmegaEntry;
+
+typedef struct {
+    OmegaEntry *    entries;    /* realloc'd with doubling */
+    int             count;
+    int             capacity;
+} Omega;
+
+static void omega_push(Omega *omega, State *z, Psi *psi) {
+    if (omega->count >= omega->capacity) {
+        omega->capacity = omega->capacity ? omega->capacity * 2 : 8;
+        omega->entries = realloc(omega->entries, omega->capacity * sizeof(OmegaEntry));
+    }
+    omega->entries[omega->count].state    = *z;
+    omega->entries[omega->count].psi_snap = psi_snapshot(psi);
+    omega->count++;
+}
+
+static void omega_pop(Omega *omega, State *z, Psi *psi) {
+    if (omega->count > 0) {
+        OmegaEntry *e = &omega->entries[--omega->count];
+        *z = e->state;
+        psi_restore(psi, &e->psi_snap);
+        free(e->psi_snap.entries);
+        e->psi_snap.entries = NULL;
+    } else {
+        memset(z, 0, sizeof(State));
+        z->PI = NULL;
+        psi->count = 0;
+    }
+}
+
+static OmegaEntry *omega_tip(Omega *omega) {
+    return omega->count > 0 ? &omega->entries[omega->count - 1] : NULL;
+}
+
+static void omega_free(Omega *omega) {
+    for (int i = 0; i < omega->count; i++)
+        free(omega->entries[i].psi_snap.entries);
+    free(omega->entries);
+    omega->entries  = NULL;
+    omega->count    = 0;
+    omega->capacity = 0;
+}
+
+/*======================================================================================
+ * State navigation
+ *======================================================================================*/
+static inline void z_down(State *z, Psi *psi) {
+    psi_push(psi, z->PI, z->ctx);
     z->sigma = z->SIGMA;
     z->delta = z->DELTA;
     z->PI    = z->PI->children[z->ctx];
     z->ctx   = 0;
 }
 
-static inline void z_down_single(State *z) {
-    z->psi   = psi_push(z->psi, z->PI, z->ctx);
+static inline void z_down_single(State *z, Psi *psi) {
+    psi_push(psi, z->PI, z->ctx);
     z->sigma = z->SIGMA;
     z->delta = z->DELTA;
     z->PI    = z->PI->children[0];
     z->ctx   = 0;
 }
 
-static inline void z_up(State *z) {
-    if (z->psi) { z->PI = z->psi->PI; z->ctx = z->psi->ctx; z->psi = z->psi->next; }
-    else        { z->PI = NULL; }
+static inline void z_up(State *z, Psi *psi) {
+    if (!psi_pop(psi, &z->PI, &z->ctx))
+        z->PI = NULL;
 }
 
-static inline void z_up_track(State *z) {
-    State *track = omega_tip();
+static inline void z_up_track(State *z, Psi *psi, Omega *omega) {
+    OmegaEntry *track = omega_tip(omega);
     if (track) {
-        track->SIGMA   = z->SIGMA;
-        track->DELTA   = z->DELTA;
-        track->sigma   = z->sigma;
-        track->delta   = z->delta;
-        track->yielded = 1;
+        track->state.SIGMA   = z->SIGMA;
+        track->state.DELTA   = z->DELTA;
+        track->state.sigma   = z->sigma;
+        track->state.delta   = z->delta;
+        track->state.yielded = 1;
     }
-    z_up(z);
+    z_up(z, psi);
 }
 
-static inline void z_up_fail(State *z) {
-    z_up(z);
-}
-
-static inline void z_next(State *z) {
-    z->sigma = z->SIGMA;
-    z->delta = z->DELTA;
+static inline void z_up_fail(State *z, Psi *psi) {
+    z_up(z, psi);
 }
 
 static inline void z_stay_next(State *z) {
@@ -408,8 +380,13 @@ static inline void z_move_next(State *z) {
     z->ctx++;
 }
 
+static inline void z_next(State *z) {
+    z->sigma = z->SIGMA;
+    z->delta = z->DELTA;
+}
+
 /*======================================================================================
- * Pattern scanners (Π_ functions from SNOBOL4c.c)
+ * Pattern scanners
  *======================================================================================*/
 static inline bool scan_move(State *z, int delta) {
     if (delta >= 0 && z->DELTA + delta <= z->OMEGA) {
@@ -417,16 +394,14 @@ static inline bool scan_move(State *z, int delta) {
         z->delta += delta;
         return true;
     }
-    return false;      /* fixed: original was missing 'return' */
+    return false;
 }
 
 static bool scan_LITERAL(State *z) {
-    const char *s = z->PI->s;
-    Py_ssize_t len = z->PI->s_len;
-    if (z->delta + len > z->OMEGA) return false;
-    if (memcmp(z->sigma, s, len) != 0) return false;
-    z->sigma += len;
-    z->delta += len;
+    if (z->delta + z->PI->s_len > z->OMEGA) return false;
+    if (memcmp(z->sigma, z->PI->s, z->PI->s_len) != 0) return false;
+    z->sigma += z->PI->s_len;
+    z->delta += z->PI->s_len;
     return true;
 }
 
@@ -501,184 +476,163 @@ static inline bool scan_OMEGA(State *z) { return z->DELTA == z->OMEGA || (z->DEL
 
 /*======================================================================================
  * THE MATCH ENGINE
- *
- * Extracted from SNOBOL4c.c with:
- *   - psi as C stack (not heap)
- *   - no lambda/command stack
- *   - no globals dictionary
- *   - returns match result
  *======================================================================================*/
 typedef struct {
-    int matched;        /* 1 = success, 0 = failure */
-    int start;          /* match start position     */
-    int end;            /* match end position       */
+    int matched;
+    int start;
+    int end;
 } MatchResult;
 
 static MatchResult engine_match(Pattern *pattern, const char *subject, int subject_len) {
     MatchResult result = {0, 0, 0};
 
-    omega_init();
+    Psi   psi   = {NULL, 0, 0};
+    Omega omega = {NULL, 0, 0};
 
     int a = PROCEED;
     State Z;
     memset(&Z, 0, sizeof(Z));
     Z.SIGMA = subject;
-    Z.DELTA = 0;
     Z.OMEGA = subject_len;
     Z.sigma = subject;
-    Z.delta = 0;
     Z.PI    = pattern;
-    Z.psi   = NULL;
 
     while (Z.PI) {
         int t = Z.PI->type;
         switch (t << 2 | a) {
 /*--- Π (alternation) ---------------------------------------------------------------*/
         case T_PI<<2|PROCEED:
-            if (Z.ctx < Z.PI->n) { a = PROCEED; omega_push(&Z);   z_down(&Z);        break; }
-            else                 { a = RECEDE;   omega_pop(&Z);                        break; }
-        case T_PI<<2|SUCCESS:    { a = SUCCESS;                    z_up(&Z);           break; }
-        case T_PI<<2|FAILURE:    { a = PROCEED;                    z_stay_next(&Z);    break; }
+            if (Z.ctx < Z.PI->n) { a = PROCEED; omega_push(&omega, &Z, &psi); z_down(&Z, &psi);              break; }
+            else                 { a = RECEDE;   omega_pop(&omega, &Z, &psi);                                  break; }
+        case T_PI<<2|SUCCESS:    { a = SUCCESS;                                 z_up(&Z, &psi);                break; }
+        case T_PI<<2|FAILURE:    { a = PROCEED;                                 z_stay_next(&Z);               break; }
         case T_PI<<2|RECEDE:
-            if (!Z.fenced)       { a = PROCEED;                    z_stay_next(&Z);    break; }
-            else                 { a = FAILURE;                    z_up_fail(&Z);      break; }
+            if (!Z.fenced)       { a = PROCEED;                                 z_stay_next(&Z);               break; }
+            else                 { a = FAILURE;                                 z_up_fail(&Z, &psi);           break; }
 /*--- Σ (sequence) ------------------------------------------------------------------*/
         case T_SIGMA<<2|PROCEED:
-            if (Z.ctx < Z.PI->n) { a = PROCEED;                   z_down(&Z);         break; }
-            else                 { a = SUCCESS;                    z_up(&Z);           break; }
-        case T_SIGMA<<2|SUCCESS: { a = PROCEED;                    z_move_next(&Z);    break; }
-        case T_SIGMA<<2|FAILURE: { a = RECEDE;   omega_pop(&Z);                        break; }
+            if (Z.ctx < Z.PI->n) { a = PROCEED;                                z_down(&Z, &psi);              break; }
+            else                 { a = SUCCESS;                                 z_up(&Z, &psi);                break; }
+        case T_SIGMA<<2|SUCCESS: { a = PROCEED;                                 z_move_next(&Z);               break; }
+        case T_SIGMA<<2|FAILURE: { a = RECEDE;   omega_pop(&omega, &Z, &psi);                                  break; }
 /*--- ρ (conjunction) ---------------------------------------------------------------*/
         case T_RHO<<2|PROCEED:
-            if (Z.ctx < Z.PI->n) { a = PROCEED;                   z_down(&Z);         break; }
-            else                 { a = SUCCESS;                    z_up(&Z);           break; }
-        case T_RHO<<2|SUCCESS:   { a = PROCEED;                    z_stay_next(&Z);    break; }
-        case T_RHO<<2|FAILURE:   { a = RECEDE;   omega_pop(&Z);                        break; }
+            if (Z.ctx < Z.PI->n) { a = PROCEED;                                z_down(&Z, &psi);              break; }
+            else                 { a = SUCCESS;                                 z_up(&Z, &psi);                break; }
+        case T_RHO<<2|SUCCESS:   { a = PROCEED;                                 z_stay_next(&Z);               break; }
+        case T_RHO<<2|FAILURE:   { a = RECEDE;   omega_pop(&omega, &Z, &psi);                                  break; }
 /*--- π (optional) ------------------------------------------------------------------*/
         case T_pi<<2|PROCEED:
-            if (Z.ctx == 0)      { a = SUCCESS;  omega_push(&Z);  z_up(&Z);           break; }
-            else if (Z.ctx == 1) { a = PROCEED;  omega_push(&Z);  z_down_single(&Z);  break; }
-            else                 { a = RECEDE;   omega_pop(&Z);                        break; }
-        case T_pi<<2|SUCCESS:    { a = SUCCESS;                    z_up(&Z);           break; }
-        case T_pi<<2|FAILURE:    { a = FAILURE;                    z_up_fail(&Z);      break; }
+            if (Z.ctx == 0)      { a = SUCCESS;  omega_push(&omega, &Z, &psi); z_up(&Z, &psi);                break; }
+            else if (Z.ctx == 1) { a = PROCEED;  omega_push(&omega, &Z, &psi); z_down_single(&Z, &psi);       break; }
+            else                 { a = RECEDE;   omega_pop(&omega, &Z, &psi);                                  break; }
+        case T_pi<<2|SUCCESS:    { a = SUCCESS;                                 z_up(&Z, &psi);                break; }
+        case T_pi<<2|FAILURE:    { a = FAILURE;                                 z_up_fail(&Z, &psi);           break; }
         case T_pi<<2|RECEDE:
-            if (!Z.fenced)       { a = PROCEED;                    z_stay_next(&Z);    break; }
-            else                 { a = FAILURE;                    z_up_fail(&Z);      break; }
+            if (!Z.fenced)       { a = PROCEED;                                 z_stay_next(&Z);               break; }
+            else                 { a = FAILURE;                                 z_up_fail(&Z, &psi);           break; }
 /*--- ARBNO -------------------------------------------------------------------------*/
         case T_ARBNO<<2|PROCEED:
-            if (Z.ctx == 0)      { a = SUCCESS;  omega_push(&Z);  z_up_track(&Z);     break; }
-            else                 { a = PROCEED;  omega_push(&Z);  z_down_single(&Z);  break; }
-        case T_ARBNO<<2|SUCCESS: { a = SUCCESS;                    z_up_track(&Z);     break; }
-        case T_ARBNO<<2|FAILURE: { a = RECEDE;   omega_pop(&Z);                        break; }
+            if (Z.ctx == 0)      { a = SUCCESS;  omega_push(&omega, &Z, &psi); z_up_track(&Z, &psi, &omega);  break; }
+            else                 { a = PROCEED;  omega_push(&omega, &Z, &psi); z_down_single(&Z, &psi);       break; }
+        case T_ARBNO<<2|SUCCESS: { a = SUCCESS;                                 z_up_track(&Z, &psi, &omega);  break; }
+        case T_ARBNO<<2|FAILURE: { a = RECEDE;   omega_pop(&omega, &Z, &psi);                                  break; }
         case T_ARBNO<<2|RECEDE:
-            if (Z.fenced)        { a = FAILURE;                    z_up_fail(&Z);      break; }
-            else if (Z.yielded)  { a = PROCEED;                    z_move_next(&Z);    break; }
-            else                 { a = FAILURE;                    z_up_fail(&Z);      break; }
+            if (Z.fenced)        { a = FAILURE;                                 z_up_fail(&Z, &psi);           break; }
+            else if (Z.yielded)  { a = PROCEED;                                 z_move_next(&Z);               break; }
+            else                 { a = FAILURE;                                 z_up_fail(&Z, &psi);           break; }
 /*--- ARB ---------------------------------------------------------------------------*/
         case T_ARB<<2|PROCEED:
-            if (scan_ARB(&Z))    { a = SUCCESS;  omega_push(&Z);  z_up(&Z);           break; }
-            else                 { a = RECEDE;   omega_pop(&Z);                        break; }
+            if (scan_ARB(&Z))    { a = SUCCESS;  omega_push(&omega, &Z, &psi); z_up(&Z, &psi);                break; }
+            else                 { a = RECEDE;   omega_pop(&omega, &Z, &psi);                                  break; }
         case T_ARB<<2|RECEDE:
-            if (!Z.fenced)       { a = PROCEED;                    z_stay_next(&Z);    break; }
-            else                 { a = FAILURE;                    z_up_fail(&Z);      break; }
+            if (!Z.fenced)       { a = PROCEED;                                 z_stay_next(&Z);               break; }
+            else                 { a = FAILURE;                                 z_up_fail(&Z, &psi);           break; }
 /*--- BAL ---------------------------------------------------------------------------*/
         case T_BAL<<2|PROCEED:
-            if (scan_BAL(&Z))    { a = SUCCESS;  omega_push(&Z);  z_up(&Z);           break; }
-            else                 { a = RECEDE;   omega_pop(&Z);                        break; }
+            if (scan_BAL(&Z))    { a = SUCCESS;  omega_push(&omega, &Z, &psi); z_up(&Z, &psi);                break; }
+            else                 { a = RECEDE;   omega_pop(&omega, &Z, &psi);                                  break; }
         case T_BAL<<2|RECEDE:
-            if (!Z.fenced)       { a = PROCEED;                    z_next(&Z);         break; }
-            else                 { a = FAILURE;                    z_up_fail(&Z);      break; }
+            if (!Z.fenced)       { a = PROCEED;                                 z_next(&Z);                    break; }
+            else                 { a = FAILURE;                                 z_up_fail(&Z, &psi);           break; }
 /*--- FENCE -------------------------------------------------------------------------*/
         case T_FENCE<<2|PROCEED:
-            if (Z.PI->n == 0)    { a = SUCCESS;  omega_push(&Z);  z_up(&Z);           break; }
-            else                 { a = PROCEED;  Z.fenced = 1;    z_down_single(&Z);  break; }
+            if (Z.PI->n == 0)    { a = SUCCESS;  omega_push(&omega, &Z, &psi); z_up(&Z, &psi);                break; }
+            else                 { a = PROCEED;  Z.fenced = 1;                  z_down_single(&Z, &psi);       break; }
         case T_FENCE<<2|RECEDE:
-            if (Z.PI->n == 0)    { a = RECEDE;                    Z.PI = NULL;        break; }
-            else                 { assert(0); break; }
+            if (Z.PI->n == 0)    { a = RECEDE;   Z.PI = NULL;                                                  break; }
+            else                 { a = FAILURE;   Z.PI = NULL;                                                  break; }
         case T_FENCE<<2|SUCCESS:
-            if (Z.PI->n == 1)    { a = SUCCESS;  Z.fenced = 0;    z_up(&Z);           break; }
-            else                 { assert(0); break; }
+            if (Z.PI->n == 1)    { a = SUCCESS;  Z.fenced = 0;                  z_up(&Z, &psi);               break; }
+            else                 { a = FAILURE;   Z.PI = NULL;                                                  break; }
         case T_FENCE<<2|FAILURE:
-            if (Z.PI->n == 1)    { a = FAILURE;  Z.fenced = 0;    z_up_fail(&Z);      break; }
-            else                 { assert(0); break; }
-/*--- Control primitives ------------------------------------------------------------*/
-        case T_ABORT<<2|PROCEED:   { a = FAILURE;                  Z.PI = NULL;        break; }
-        case T_SUCCEED<<2|PROCEED: { a = SUCCESS; omega_push(&Z);  z_up(&Z);           break; }
+            if (Z.PI->n == 1)    { a = FAILURE;  Z.fenced = 0;                  z_up_fail(&Z, &psi);          break; }
+            else                 { a = FAILURE;   Z.PI = NULL;                                                  break; }
+/*--- Control -----------------------------------------------------------------------*/
+        case T_ABORT<<2|PROCEED:   { a = FAILURE;  Z.PI = NULL;                                                break; }
+        case T_SUCCEED<<2|PROCEED: { a = SUCCESS;  omega_push(&omega, &Z, &psi); z_up(&Z, &psi);              break; }
         case T_SUCCEED<<2|RECEDE:
-            if (!Z.fenced)         { a = PROCEED;                  z_stay_next(&Z);    break; }
-            else                   { a = FAILURE;                  z_up_fail(&Z);      break; }
-        case T_FAIL<<2|PROCEED:    { a = FAILURE;                  z_up_fail(&Z);      break; }
-        case T_EPSILON<<2|PROCEED: { a = SUCCESS;                  z_up(&Z);           break; }
-/*--- Leaf scanners — only respond to PROCEED ---------------------------------------*/
+            if (!Z.fenced)         { a = PROCEED;                                z_stay_next(&Z);              break; }
+            else                   { a = FAILURE;                                z_up_fail(&Z, &psi);          break; }
+        case T_FAIL<<2|PROCEED:    { a = FAILURE;                                z_up_fail(&Z, &psi);          break; }
+        case T_EPSILON<<2|PROCEED: { a = SUCCESS;                                z_up(&Z, &psi);               break; }
+/*--- Leaf scanners -----------------------------------------------------------------*/
         case T_LITERAL<<2|PROCEED:
-            if (scan_LITERAL(&Z))  { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_LITERAL(&Z))  { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_ANY<<2|PROCEED:
-            if (scan_ANY(&Z))      { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_ANY(&Z))      { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_NOTANY<<2|PROCEED:
-            if (scan_NOTANY(&Z))   { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_NOTANY(&Z))   { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_SPAN<<2|PROCEED:
-            if (scan_SPAN(&Z))     { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_SPAN(&Z))     { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_BREAK<<2|PROCEED:
-            if (scan_BREAK(&Z))    { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_BREAK(&Z))    { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_POS<<2|PROCEED:
-            if (scan_POS(&Z))      { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_POS(&Z))      { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_RPOS<<2|PROCEED:
-            if (scan_RPOS(&Z))     { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_RPOS(&Z))     { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_LEN<<2|PROCEED:
-            if (scan_LEN(&Z))      { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_LEN(&Z))      { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_TAB<<2|PROCEED:
-            if (scan_TAB(&Z))      { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_TAB(&Z))      { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_RTAB<<2|PROCEED:
-            if (scan_RTAB(&Z))     { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_RTAB(&Z))     { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_REM<<2|PROCEED:
-            if (scan_REM(&Z))      { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_REM(&Z))      { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_ALPHA<<2|PROCEED:
-            if (scan_ALPHA(&Z))    { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
+            if (scan_ALPHA(&Z))    { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
         case T_OMEGA<<2|PROCEED:
-            if (scan_OMEGA(&Z))    { a = SUCCESS; z_up(&Z);  break; }
-            else                   { a = FAILURE; z_up_fail(&Z); break; }
-/*--- MARB (like ARB) ---------------------------------------------------------------*/
+            if (scan_OMEGA(&Z))    { a = SUCCESS; z_up(&Z, &psi); } else { a = FAILURE; z_up_fail(&Z, &psi); } break;
+/*--- MARB --------------------------------------------------------------------------*/
         case T_MARB<<2|PROCEED:
-            if (scan_ARB(&Z))      { a = SUCCESS; omega_push(&Z); z_up(&Z);  break; }
-            else                   { a = RECEDE;  omega_pop(&Z);              break; }
+            if (scan_ARB(&Z))      { a = SUCCESS; omega_push(&omega, &Z, &psi); z_up(&Z, &psi); break; }
+            else                   { a = RECEDE;  omega_pop(&omega, &Z, &psi);                   break; }
         case T_MARB<<2|RECEDE:
-            if (!Z.fenced)         { a = PROCEED;                  z_stay_next(&Z); break; }
-            else                   { a = FAILURE;                  z_up_fail(&Z);   break; }
+            if (!Z.fenced)         { a = PROCEED;                                z_stay_next(&Z); break; }
+            else                   { a = FAILURE;                                z_up_fail(&Z, &psi); break; }
 /*-----------------------------------------------------------------------------------*/
         default:
-            /* Unhandled type/action combination — treat as failure */
             a = FAILURE;
             Z.PI = NULL;
             break;
         }
     }
 
-    /* Determine result: success if the last action was SUCCESS when PI went NULL.
-     * Use Z.delta (current scan cursor) not Z.DELTA (committed position) because
-     * the final z_up exits before Σ can commit via z_move_next. */
     if (a == SUCCESS) {
         result.matched = 1;
         result.start   = 0;
         result.end     = Z.delta;
     }
 
+    /* Cleanup */
+    free(psi.entries);
+    omega_free(&omega);
+
     return result;
 }
 
 /*======================================================================================
- * CPython module: match(pattern, subject) → (start, end) or None
+ * CPython module
  *======================================================================================*/
 static PyObject *py_match(PyObject *self, PyObject *args) {
     PyObject *py_pattern;
@@ -688,27 +642,18 @@ static PyObject *py_match(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "Os#", &py_pattern, &subject, &subject_len))
         return NULL;
 
-    /* Build C pattern tree */
-    Arena arena = {NULL, 0, 0};
-    Pattern *root = convert(&arena, py_pattern);
-    if (!root) {
-        arena_free(&arena);
-        return NULL;
-    }
+    PatternList pl = {NULL, 0};
+    Pattern *root = convert(&pl, py_pattern);
+    if (!root) { pattern_free_all(&pl); return NULL; }
 
-    /* Run engine */
     MatchResult result = engine_match(root, subject, (int)subject_len);
+    pattern_free_all(&pl);
 
-    /* Cleanup */
-    arena_free(&arena);
-
-    /* Return */
     if (result.matched)
         return Py_BuildValue("(ii)", result.start, result.end);
     Py_RETURN_NONE;
 }
 
-/*--- search(pattern, subject) → tries all starting positions -----------------------*/
 static PyObject *py_search(PyObject *self, PyObject *args) {
     PyObject *py_pattern;
     const char *subject;
@@ -717,27 +662,22 @@ static PyObject *py_search(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "Os#", &py_pattern, &subject, &subject_len))
         return NULL;
 
-    Arena arena = {NULL, 0, 0};
-    Pattern *root = convert(&arena, py_pattern);
-    if (!root) {
-        arena_free(&arena);
-        return NULL;
-    }
+    PatternList pl = {NULL, 0};
+    Pattern *root = convert(&pl, py_pattern);
+    if (!root) { pattern_free_all(&pl); return NULL; }
 
-    /* Try each starting position */
     for (Py_ssize_t start = 0; start <= subject_len; start++) {
         MatchResult result = engine_match(root, subject + start, (int)(subject_len - start));
         if (result.matched) {
-            arena_free(&arena);
+            pattern_free_all(&pl);
             return Py_BuildValue("(ii)", (int)start, (int)start + result.end);
         }
     }
 
-    arena_free(&arena);
+    pattern_free_all(&pl);
     Py_RETURN_NONE;
 }
 
-/*--- fullmatch(pattern, subject) → match requiring full consumption ----------------*/
 static PyObject *py_fullmatch(PyObject *self, PyObject *args) {
     PyObject *py_pattern;
     const char *subject;
@@ -746,16 +686,12 @@ static PyObject *py_fullmatch(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "Os#", &py_pattern, &subject, &subject_len))
         return NULL;
 
-    Arena arena = {NULL, 0, 0};
-    Pattern *root = convert(&arena, py_pattern);
-    if (!root) {
-        arena_free(&arena);
-        return NULL;
-    }
+    PatternList pl = {NULL, 0};
+    Pattern *root = convert(&pl, py_pattern);
+    if (!root) { pattern_free_all(&pl); return NULL; }
 
     MatchResult result = engine_match(root, subject, (int)subject_len);
-
-    arena_free(&arena);
+    pattern_free_all(&pl);
 
     if (result.matched && result.end == (int)subject_len)
         return Py_BuildValue("(ii)", result.start, result.end);
@@ -766,12 +702,9 @@ static PyObject *py_fullmatch(PyObject *self, PyObject *args) {
  * Module definition
  *======================================================================================*/
 static PyMethodDef snobol4c_methods[] = {
-    {"match",     py_match,     METH_VARARGS, "match(pattern, subject) -> (start, end) or None\n"
-                                              "Anchored match at position 0."},
-    {"search",    py_search,    METH_VARARGS, "search(pattern, subject) -> (start, end) or None\n"
-                                              "Unanchored search across all starting positions."},
-    {"fullmatch", py_fullmatch, METH_VARARGS, "fullmatch(pattern, subject) -> (start, end) or None\n"
-                                              "Match requiring full subject consumption."},
+    {"match",     py_match,     METH_VARARGS, "match(pattern, subject) -> (start, end) or None"},
+    {"search",    py_search,    METH_VARARGS, "search(pattern, subject) -> (start, end) or None"},
+    {"fullmatch", py_fullmatch, METH_VARARGS, "fullmatch(pattern, subject) -> (start, end) or None"},
     {NULL, NULL, 0, NULL}
 };
 
