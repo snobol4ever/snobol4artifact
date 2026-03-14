@@ -3,12 +3,18 @@
  *
  * Python builds the PATTERN tree.  C runs the match engine.  Python gets the result.
  *
- * Memory: malloc/realloc throughout.  No arenas, no fixed limits.
- *   - realloc(NULL, size) = malloc
+ * Memory: malloc/realloc throughout.  No arenas, no fixed limits.\n *   - realloc(NULL, size) = malloc
  *   - realloc(p, 0)       = free
  *
  * Build:
  *   python3 setup.py build_ext --inplace
+ *
+ * Synced from SNOBOL4-tiny/src/runtime/engine.c (2026-03-14):
+ *   - scan_POS / scan_TAB: added scan_start offset so POS(n)/TAB(n) work correctly
+ *     when engine is called on a substring during search (py_search passes start pos).
+ *   - State.scan_start field added; engine_match() takes scan_start parameter.
+ *   - ARBNO RECEDE: added zero-progress guard (Z.delta > Z.DELTA) to prevent
+ *     infinite loops when ARBNO child matches empty string repeatedly.
  *======================================================================================*/
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
@@ -273,6 +279,10 @@ typedef struct {
     int             fenced;
     int             yielded;
     int             ctx;
+    /* Absolute start offset of this sub-string in the original subject.
+     * Makes POS/TAB work correctly when engine is called on a substring
+     * (e.g. during search across positions). Zero for full-string matches. */
+    int             scan_start;
 } State;
 
 /*======================================================================================
@@ -465,10 +475,10 @@ static bool scan_BAL(State *z) {
     return false;
 }
 
-static inline bool scan_POS(State *z)   { return z->PI->n == z->DELTA; }
+static inline bool scan_POS(State *z)   { return z->PI->n == z->DELTA + z->scan_start; }
 static inline bool scan_RPOS(State *z)  { return z->PI->n == z->OMEGA - z->DELTA; }
 static inline bool scan_LEN(State *z)   { return scan_move(z, z->PI->n); }
-static inline bool scan_TAB(State *z)   { return scan_move(z, z->PI->n - z->DELTA); }
+static inline bool scan_TAB(State *z)   { return scan_move(z, z->PI->n - z->DELTA - z->scan_start); }
 static inline bool scan_REM(State *z)   { return scan_move(z, z->OMEGA - z->DELTA); }
 static inline bool scan_RTAB(State *z)  { return scan_move(z, z->OMEGA - z->DELTA - z->PI->n); }
 static inline bool scan_ALPHA(State *z) { return z->DELTA == 0 || (z->DELTA > 0 && z->SIGMA[-1] == '\n'); }
@@ -483,7 +493,7 @@ typedef struct {
     int end;
 } MatchResult;
 
-static MatchResult engine_match(Pattern *pattern, const char *subject, int subject_len) {
+static MatchResult engine_match(Pattern *pattern, const char *subject, int subject_len, int scan_start) {
     MatchResult result = {0, 0, 0};
 
     Psi   psi   = {NULL, 0, 0};
@@ -492,10 +502,11 @@ static MatchResult engine_match(Pattern *pattern, const char *subject, int subje
     int a = PROCEED;
     State Z;
     memset(&Z, 0, sizeof(Z));
-    Z.SIGMA = subject;
-    Z.OMEGA = subject_len;
-    Z.sigma = subject;
-    Z.PI    = pattern;
+    Z.SIGMA      = subject;
+    Z.OMEGA      = subject_len;
+    Z.sigma      = subject;
+    Z.PI         = pattern;
+    Z.scan_start = scan_start;
 
     while (Z.PI) {
         int t = Z.PI->type;
@@ -538,9 +549,10 @@ static MatchResult engine_match(Pattern *pattern, const char *subject, int subje
         case T_ARBNO<<2|SUCCESS: { a = SUCCESS;                                 z_up_track(&Z, &psi, &omega);  break; }
         case T_ARBNO<<2|FAILURE: { a = RECEDE;   omega_pop(&omega, &Z, &psi);                                  break; }
         case T_ARBNO<<2|RECEDE:
-            if (Z.fenced)        { a = FAILURE;                                 z_up_fail(&Z, &psi);           break; }
-            else if (Z.yielded)  { a = PROCEED;                                 z_move_next(&Z);               break; }
-            else                 { a = FAILURE;                                 z_up_fail(&Z, &psi);           break; }
+            if (Z.fenced)                            { a = FAILURE; z_up_fail(&Z, &psi);  break; }
+            else if (Z.yielded && Z.delta > Z.DELTA) { a = PROCEED; z_move_next(&Z);      break; } /* made progress */
+            else if (Z.yielded)                      { a = FAILURE; z_up_fail(&Z, &psi);  break; } /* zero-progress: stop */
+            else                                     { a = FAILURE; z_up_fail(&Z, &psi);  break; }
 /*--- ARB ---------------------------------------------------------------------------*/
         case T_ARB<<2|PROCEED:
             if (scan_ARB(&Z))    { a = SUCCESS;  omega_push(&omega, &Z, &psi); z_up(&Z, &psi);                break; }
@@ -646,7 +658,7 @@ static PyObject *py_match(PyObject *self, PyObject *args) {
     Pattern *root = convert(&pl, py_pattern);
     if (!root) { pattern_free_all(&pl); return NULL; }
 
-    MatchResult result = engine_match(root, subject, (int)subject_len);
+    MatchResult result = engine_match(root, subject, (int)subject_len, 0);
     pattern_free_all(&pl);
 
     if (result.matched)
@@ -667,7 +679,7 @@ static PyObject *py_search(PyObject *self, PyObject *args) {
     if (!root) { pattern_free_all(&pl); return NULL; }
 
     for (Py_ssize_t start = 0; start <= subject_len; start++) {
-        MatchResult result = engine_match(root, subject + start, (int)(subject_len - start));
+        MatchResult result = engine_match(root, subject + start, (int)(subject_len - start), (int)start);
         if (result.matched) {
             pattern_free_all(&pl);
             return Py_BuildValue("(ii)", (int)start, (int)start + result.end);
@@ -690,7 +702,7 @@ static PyObject *py_fullmatch(PyObject *self, PyObject *args) {
     Pattern *root = convert(&pl, py_pattern);
     if (!root) { pattern_free_all(&pl); return NULL; }
 
-    MatchResult result = engine_match(root, subject, (int)subject_len);
+    MatchResult result = engine_match(root, subject, (int)subject_len, 0);
     pattern_free_all(&pl);
 
     if (result.matched && result.end == (int)subject_len)
