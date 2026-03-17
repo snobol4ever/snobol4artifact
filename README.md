@@ -1,9 +1,9 @@
-# SNOBOL4-cpython
+# snobol4artifact
 [![License: LGPL v3](https://img.shields.io/badge/License-LGPL_v3-blue.svg)](https://www.gnu.org/licenses/lgpl-3.0)
 
 CPython C extension: SNOBOL4 pattern match engine.
 
-Python builds the pattern tree using [SNOBOL4python](https://github.com/SNOBOL4-plus/SNOBOL4-python)
+Python builds the pattern tree using [SNOBOL4python](https://github.com/snobol4ever/snobol4python)
 objects. C runs the Byrd Box engine. Python gets `(start, end)` or `None`.
 
 ```python
@@ -59,12 +59,12 @@ The engine handles: `LITERAL`, `ANY`, `NOTANY`, `SPAN`, `BREAK`, `POS`, `RPOS`,
 | v1 | Arena bump allocator — slab of Pattern nodes, freed all at once | 788 | First working proof-of-concept |
 | v2 | Per-node `malloc` + `PatternList` tracker | 721 | Cleaner; no relocation issues; this is the current version |
 
-`engine.c` in [SNOBOL4-tiny](https://github.com/SNOBOL4-plus/SNOBOL4-tiny)
+`engine.c` in [snobol4x](https://github.com/snobol4ever/snobol4x)
 was extracted from v2 of this file.
 
 ## Relation to SPIPAT
 
-[SNOBOL4python](https://github.com/SNOBOL4-plus/SNOBOL4-python) currently uses
-SPIPAT as its C backend. SNOBOL4-cpython is an alternative backend — same
+[SNOBOL4python](https://github.com/snobol4ever/snobol4python) currently uses
+SPIPAT as its C backend. snobol4artifact is an alternative backend — same
 pattern tree, different engine. Long-term it is a candidate to replace SPIPAT
-with a SNOBOL4-plus-owned implementation.
+with a snobol4ever-owned implementation.

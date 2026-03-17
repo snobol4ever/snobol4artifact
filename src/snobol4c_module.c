@@ -9,7 +9,7 @@
  * Build:
  *   python3 setup.py build_ext --inplace
  *
- * Synced from SNOBOL4-tiny/src/runtime/engine.c (2026-03-14):
+ * Synced from snobol4x/src/runtime/engine.c (2026-03-14):
  *   - scan_POS / scan_TAB: added scan_start offset so POS(n)/TAB(n) work correctly
  *     when engine is called on a substring during search (py_search passes start pos).
  *   - State.scan_start field added; engine_match() takes scan_start parameter.
